@@ -1,39 +1,50 @@
-import { Readable } from 'stream'
-import express, {
-  ErrorRequestHandler,
-  NextFunction,
-  RequestHandler,
-} from 'express'
+import { check, schema } from '@atproto/common'
 import {
+  LexiconDoc,
   Lexicons,
   lexToJson,
   LexXrpcProcedure,
   LexXrpcQuery,
   LexXrpcSubscription,
 } from '@atproto/lexicon'
-import { check, forwardStreamErrors, schema } from '@atproto/common'
+import express, {
+  Application,
+  ErrorRequestHandler,
+  Express,
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+  Router,
+} from 'express'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+
+import log from './logger'
+import { consumeMany, resetMany } from './rate-limiter'
 import { ErrorFrame, Frame, MessageFrame, XrpcStreamServer } from './stream'
 import {
-  XRPCHandler,
-  XRPCError,
-  InvalidRequestError,
-  HandlerOutput,
-  HandlerSuccess,
-  handlerSuccess,
-  XRPCHandlerConfig,
-  MethodNotImplementedError,
-  HandlerAuth,
   AuthVerifier,
-  isHandlerError,
-  Options,
-  XRPCStreamHandlerConfig,
-  XRPCStreamHandler,
-  Params,
+  HandlerAuth,
+  HandlerPipeThrough,
+  HandlerSuccess,
   InternalServerError,
-  XRPCReqContext,
-  RateLimiterI,
-  RateLimiterConsume,
+  InvalidRequestError,
+  isHandlerError,
+  isHandlerPipeThroughBuffer,
+  isHandlerPipeThroughStream,
   isShared,
+  MethodNotImplementedError,
+  Options,
+  Params,
+  RateLimiterI,
+  RateLimitExceededError,
+  XRPCError,
+  XRPCHandler,
+  XRPCHandlerConfig,
+  XRPCReqContext,
+  XRPCStreamHandler,
+  XRPCStreamHandlerConfig,
 } from './types'
 import {
   decodeQueryParams,
@@ -41,32 +52,30 @@ import {
   validateInput,
   validateOutput,
 } from './util'
-import log from './logger'
-import { consumeMany } from './rate-limiter'
 
-export function createServer(lexicons?: unknown[], options?: Options) {
+export function createServer(lexicons?: LexiconDoc[], options?: Options) {
   return new Server(lexicons, options)
 }
 
 export class Server {
-  router = express()
-  routes = express.Router()
+  router: Express = express()
+  routes: Router = express.Router()
   subscriptions = new Map<string, XrpcStreamServer>()
   lex = new Lexicons()
   options: Options
   middleware: Record<'json' | 'text', RequestHandler>
   globalRateLimiters: RateLimiterI[]
   sharedRateLimiters: Record<string, RateLimiterI>
-  routeRateLimiterFns: Record<string, RateLimiterConsume[]>
+  routeRateLimiters: Record<string, RateLimiterI[]>
 
-  constructor(lexicons?: unknown[], opts?: Options) {
+  constructor(lexicons?: LexiconDoc[], opts?: Options) {
     if (lexicons) {
       this.addLexicons(lexicons)
     }
     this.router.use(this.routes)
     this.router.use('/xrpc/:methodId', this.catchall.bind(this))
     this.router.use(errorMiddleware)
-    this.router.once('mount', (app: express.Application) => {
+    this.router.once('mount', (app: Application) => {
       this.enableStreamingOnListen(app)
     })
     this.options = opts ?? {}
@@ -76,7 +85,7 @@ export class Server {
     }
     this.globalRateLimiters = []
     this.sharedRateLimiters = {}
-    this.routeRateLimiterFns = {}
+    this.routeRateLimiters = {}
     if (opts?.rateLimits?.global) {
       for (const limit of opts.rateLimits.global) {
         const rateLimiter = opts.rateLimits.creator({
@@ -139,11 +148,11 @@ export class Server {
   // schemas
   // =
 
-  addLexicon(doc: unknown) {
+  addLexicon(doc: LexiconDoc) {
     this.lex.add(doc)
   }
 
-  addLexicons(docs: unknown[]) {
+  addLexicons(docs: LexiconDoc[]) {
     for (const doc of docs) {
       this.addLexicon(doc)
     }
@@ -171,15 +180,38 @@ export class Server {
     this.routes[verb](
       `/xrpc/${nsid}`,
       ...middleware,
-      this.createHandler(nsid, def, config.handler),
+      this.createHandler(nsid, def, config),
     )
   }
 
-  async catchall(
-    req: express.Request,
-    _res: express.Response,
-    next: NextFunction,
-  ) {
+  async catchall(req: Request, res: Response, next: NextFunction) {
+    if (this.globalRateLimiters) {
+      try {
+        const rlRes = await consumeMany(
+          {
+            req,
+            res,
+            auth: undefined,
+            params: {},
+            input: undefined,
+            async resetRouteRateLimits() {},
+          },
+          this.globalRateLimiters.map(
+            (rl) => (ctx: XRPCReqContext) => rl.consume(ctx),
+          ),
+        )
+        if (rlRes instanceof RateLimitExceededError) {
+          return next(rlRes)
+        }
+      } catch (err) {
+        return next(err)
+      }
+    }
+
+    if (this.options.catchall) {
+      return this.options.catchall(req, res, next)
+    }
+
     const def = this.lex.getDef(req.params.methodId)
     if (!def) {
       return next(new MethodNotImplementedError())
@@ -204,20 +236,32 @@ export class Server {
   createHandler(
     nsid: string,
     def: LexXrpcQuery | LexXrpcProcedure,
-    handler: XRPCHandler,
+    routeCfg: XRPCHandlerConfig,
   ): RequestHandler {
-    const validateReqInput = (req: express.Request) =>
-      validateInput(nsid, def, req, this.options, this.lex)
+    const routeOpts = {
+      blobLimit: routeCfg.opts?.blobLimit ?? this.options.payload?.blobLimit,
+    }
+    const validateReqInput = (req: Request) =>
+      validateInput(nsid, def, req, routeOpts, this.lex)
     const validateResOutput =
       this.options.validateResponse === false
-        ? (output?: HandlerSuccess) => output
-        : (output?: HandlerSuccess) =>
+        ? null
+        : (output: undefined | HandlerSuccess) =>
             validateOutput(nsid, def, output, this.lex)
     const assertValidXrpcParams = (params: unknown) =>
       this.lex.assertValidXrpcParams(nsid, params)
-    const rlFns = this.routeRateLimiterFns[nsid] ?? []
+    const rls = this.routeRateLimiters[nsid] ?? []
     const consumeRateLimit = (reqCtx: XRPCReqContext) =>
-      consumeMany(reqCtx, rlFns)
+      consumeMany(
+        reqCtx,
+        rls.map((rl) => (ctx: XRPCReqContext) => rl.consume(ctx)),
+      )
+
+    const resetRateLimit = (reqCtx: XRPCReqContext) =>
+      resetMany(
+        reqCtx,
+        rls.map((rl) => (ctx: XRPCReqContext) => rl.reset(ctx)),
+      )
 
     return async function (req, res, next) {
       try {
@@ -230,11 +274,6 @@ export class Server {
         }
         const input = validateReqInput(req)
 
-        if (input?.body instanceof Readable) {
-          // If the body stream errors at any time, abort the request
-          input.body.once('error', next)
-        }
-
         const locals: RequestLocals = req[kRequestLocals]
 
         const reqCtx: XRPCReqContext = {
@@ -243,58 +282,63 @@ export class Server {
           auth: locals.auth,
           req,
           res,
+          resetRouteRateLimits: async () => resetRateLimit(reqCtx),
         }
 
         // handle rate limits
-        if (consumeRateLimit) {
-          await consumeRateLimit(reqCtx)
+        const result = await consumeRateLimit(reqCtx)
+        if (result instanceof RateLimitExceededError) {
+          return next(result)
         }
 
         // run the handler
-        const outputUnvalidated = await handler(reqCtx)
+        const output = await routeCfg.handler(reqCtx)
 
-        if (isHandlerError(outputUnvalidated)) {
-          throw XRPCError.fromError(outputUnvalidated)
-        }
+        if (!output) {
+          validateResOutput?.(output)
+          res.status(200)
+          res.end()
+        } else if (isHandlerPipeThroughStream(output)) {
+          setHeaders(res, output)
+          res.status(200)
+          res.header('Content-Type', output.encoding)
+          await pipeline(output.stream, res)
+        } else if (isHandlerPipeThroughBuffer(output)) {
+          setHeaders(res, output)
+          res.status(200)
+          res.header('Content-Type', output.encoding)
+          res.end(output.buffer)
+        } else if (isHandlerError(output)) {
+          next(XRPCError.fromError(output))
+        } else {
+          validateResOutput?.(output)
 
-        if (!outputUnvalidated || isHandlerSuccess(outputUnvalidated)) {
-          // validate response
-          const output = validateResOutput(outputUnvalidated)
-          // set headers
-          if (output?.headers) {
-            Object.entries(output.headers).forEach(([name, val]) => {
-              res.header(name, val)
-            })
-          }
-          // send response
+          res.status(200)
+          setHeaders(res, output)
+
           if (
-            output?.encoding === 'application/json' ||
-            output?.encoding === 'json'
+            output.encoding === 'application/json' ||
+            output.encoding === 'json'
           ) {
             const json = lexToJson(output.body)
-            res.status(200).json(json)
-          } else if (output?.body instanceof Readable) {
+            res.json(json)
+          } else if (output.body instanceof Readable) {
             res.header('Content-Type', output.encoding)
-            res.status(200)
-            res.once('error', (err) => res.destroy(err))
-            forwardStreamErrors(output.body, res)
-            output.body.pipe(res)
-          } else if (output) {
-            res
-              .header('Content-Type', output.encoding)
-              .status(200)
-              .send(
-                output.body instanceof Uint8Array
+            await pipeline(output.body, res)
+          } else {
+            res.header('Content-Type', output.encoding)
+            res.send(
+              Buffer.isBuffer(output.body)
+                ? output.body
+                : output.body instanceof Uint8Array
                   ? Buffer.from(output.body)
                   : output.body,
-              )
-          } else {
-            res.status(200).end()
+            )
           }
         }
       } catch (err: unknown) {
         // Express will not call the next middleware (errorMiddleware in this case)
-        // if the value passed to next is falsy (e.g. null, undefined, 0).
+        // if the value passed to next is false-y (e.g. null, undefined, 0).
         // Hence we replace it with an InternalServerError.
         if (!err) {
           next(new InternalServerError())
@@ -321,7 +365,7 @@ export class Server {
             // authenticate request
             const auth = await config.auth?.({ req })
             if (isHandlerError(auth)) {
-              throw XRPCError.fromError(auth)
+              throw XRPCError.fromHandlerError(auth)
             }
             // validate request
             let params = decodeQueryParams(def, getQueryParams(req.url))
@@ -368,7 +412,7 @@ export class Server {
     )
   }
 
-  private enableStreamingOnListen(app: express.Application) {
+  private enableStreamingOnListen(app: Application) {
     const _listen = app.listen
     app.listen = (...args) => {
       // @ts-ignore the args spread
@@ -388,35 +432,41 @@ export class Server {
   }
 
   private setupRouteRateLimits(nsid: string, config: XRPCHandlerConfig) {
-    this.routeRateLimiterFns[nsid] = []
+    this.routeRateLimiters[nsid] = []
     for (const limit of this.globalRateLimiters) {
-      const consumeFn = async (ctx: XRPCReqContext) => {
-        return limit.consume(ctx)
-      }
-      this.routeRateLimiterFns[nsid].push(consumeFn)
+      this.routeRateLimiters[nsid].push({
+        consume: (ctx: XRPCReqContext) => limit.consume(ctx),
+        reset: (ctx: XRPCReqContext) => limit.reset(ctx),
+      })
     }
 
     if (config.rateLimit) {
       const limits = Array.isArray(config.rateLimit)
         ? config.rateLimit
         : [config.rateLimit]
-      this.routeRateLimiterFns[nsid] = []
-      for (const limit of limits) {
+      this.routeRateLimiters[nsid] = []
+      for (let i = 0; i < limits.length; i++) {
+        const limit = limits[i]
         const { calcKey, calcPoints } = limit
         if (isShared(limit)) {
           const rateLimiter = this.sharedRateLimiters[limit.name]
           if (rateLimiter) {
-            const consumeFn = (ctx: XRPCReqContext) =>
-              rateLimiter.consume(ctx, {
-                calcKey,
-                calcPoints,
-              })
-            this.routeRateLimiterFns[nsid].push(consumeFn)
+            this.routeRateLimiters[nsid].push({
+              consume: (ctx: XRPCReqContext) =>
+                rateLimiter.consume(ctx, {
+                  calcKey,
+                  calcPoints,
+                }),
+              reset: (ctx: XRPCReqContext) =>
+                rateLimiter.reset(ctx, {
+                  calcKey,
+                }),
+            })
           }
         } else {
           const { durationMs, points } = limit
           const rateLimiter = this.options.rateLimits?.creator({
-            keyPrefix: nsid,
+            keyPrefix: `nsid-${i}`,
             durationMs,
             points,
             calcKey,
@@ -424,12 +474,17 @@ export class Server {
           })
           if (rateLimiter) {
             this.sharedRateLimiters[nsid] = rateLimiter
-            const consumeFn = (ctx: XRPCReqContext) =>
-              rateLimiter.consume(ctx, {
-                calcKey,
-                calcPoints,
-              })
-            this.routeRateLimiterFns[nsid].push(consumeFn)
+            this.routeRateLimiters[nsid].push({
+              consume: (ctx: XRPCReqContext) =>
+                rateLimiter.consume(ctx, {
+                  calcKey,
+                  calcPoints,
+                }),
+              reset: (ctx: XRPCReqContext) =>
+                rateLimiter.reset(ctx, {
+                  calcKey,
+                }),
+            })
           }
         }
       }
@@ -437,8 +492,16 @@ export class Server {
   }
 }
 
-function isHandlerSuccess(v: HandlerOutput): v is HandlerSuccess {
-  return handlerSuccess.safeParse(v).success
+function setHeaders(
+  res: Response,
+  result: HandlerSuccess | HandlerPipeThrough,
+) {
+  const { headers } = result
+  if (headers) {
+    for (const [name, val] of Object.entries(headers)) {
+      if (val != null) res.header(name, val)
+    }
+  }
 }
 
 const kRequestLocals = Symbol('requestLocals')
@@ -461,7 +524,7 @@ function createAuthMiddleware(verifier: AuthVerifier): RequestHandler {
     try {
       const result = await verifier({ req, res })
       if (isHandlerError(result)) {
-        throw XRPCError.fromError(result)
+        throw XRPCError.fromHandlerError(result)
       }
       const locals: RequestLocals = req[kRequestLocals]
       locals.auth = result
@@ -475,14 +538,23 @@ function createAuthMiddleware(verifier: AuthVerifier): RequestHandler {
 const errorMiddleware: ErrorRequestHandler = function (err, req, res, next) {
   const locals: RequestLocals | undefined = req[kRequestLocals]
   const methodSuffix = locals ? ` method ${locals.nsid}` : ''
-  if (err instanceof XRPCError) {
-    log.error(err, `error in xrpc${methodSuffix}`)
-  } else {
+  const xrpcError = XRPCError.fromError(err)
+  if (xrpcError instanceof InternalServerError) {
+    // log trace for unhandled exceptions
     log.error(err, `unhandled exception in xrpc${methodSuffix}`)
+  } else {
+    // do not log trace for known xrpc errors
+    log.error(
+      {
+        status: xrpcError.type,
+        message: xrpcError.message,
+        name: xrpcError.customErrorName,
+      },
+      `error in xrpc${methodSuffix}`,
+    )
   }
   if (res.headersSent) {
     return next(err)
   }
-  const xrpcError = XRPCError.fromError(err)
   return res.status(xrpcError.type).json(xrpcError.payload)
 }

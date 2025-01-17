@@ -1,48 +1,104 @@
 import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../../../../lexicon'
-import { softDeleted } from '../../../../db/util'
+import { QueryParams } from '../../../../lexicon/types/app/bsky/actor/getProfile'
 import AppContext from '../../../../context'
-import { setRepoRev } from '../../../util'
+import { resHeaders } from '../../../util'
+import { createPipeline, noRules } from '../../../../pipeline'
+import {
+  HydrateCtx,
+  HydrationState,
+  Hydrator,
+} from '../../../../hydration/hydrator'
+import { Views } from '../../../../views'
 
 export default function (server: Server, ctx: AppContext) {
+  const getProfile = createPipeline(skeleton, hydration, noRules, presentation)
   server.app.bsky.actor.getProfile({
-    auth: ctx.authOptionalAccessOrRoleVerifier,
-    handler: async ({ auth, params, res }) => {
-      const { actor } = params
-      const requester = 'did' in auth.credentials ? auth.credentials.did : null
-      const canViewTakendownProfile =
-        auth.credentials.type === 'role' && auth.credentials.triage
-      const db = ctx.db.getReplica()
-      const actorService = ctx.services.actor(db)
+    auth: ctx.authVerifier.optionalStandardOrRole,
+    handler: async ({ auth, params, req }) => {
+      const { viewer, includeTakedowns } = ctx.authVerifier.parseCreds(auth)
+      const labelers = ctx.reqLabelers(req)
+      const hydrateCtx = await ctx.hydrator.createContext({
+        labelers,
+        viewer,
+        includeTakedowns,
+      })
 
-      const [actorRes, repoRev] = await Promise.all([
-        actorService.getActor(actor, true),
-        actorService.getRepoRev(requester),
-      ])
-      setRepoRev(res, repoRev)
+      const result = await getProfile({ ...params, hydrateCtx }, ctx)
 
-      if (!actorRes) {
-        throw new InvalidRequestError('Profile not found')
-      }
-      if (!canViewTakendownProfile && softDeleted(actorRes)) {
-        throw new InvalidRequestError(
-          'Account has been taken down',
-          'AccountTakedown',
-        )
-      }
-      const profile = await actorService.views.profileDetailed(
-        actorRes,
-        requester,
-        { includeSoftDeleted: canViewTakendownProfile },
-      )
-      if (!profile) {
-        throw new InvalidRequestError('Profile not found')
-      }
+      const repoRev = await ctx.hydrator.actor.getRepoRevSafe(viewer)
 
       return {
         encoding: 'application/json',
-        body: profile,
+        body: result,
+        headers: resHeaders({
+          repoRev,
+          labelers: hydrateCtx.labelers,
+        }),
       }
     },
   })
 }
+
+const skeleton = async (input: {
+  ctx: Context
+  params: Params
+}): Promise<SkeletonState> => {
+  const { ctx, params } = input
+  const [did] = await ctx.hydrator.actor.getDids([params.actor])
+  if (!did) {
+    throw new InvalidRequestError('Profile not found')
+  }
+  return { did }
+}
+
+const hydration = async (input: {
+  ctx: Context
+  params: Params
+  skeleton: SkeletonState
+}) => {
+  const { ctx, params, skeleton } = input
+  return ctx.hydrator.hydrateProfilesDetailed(
+    [skeleton.did],
+    params.hydrateCtx.copy({
+      includeActorTakedowns: true,
+    }),
+  )
+}
+
+const presentation = (input: {
+  ctx: Context
+  params: Params
+  skeleton: SkeletonState
+  hydration: HydrationState
+}) => {
+  const { ctx, params, skeleton, hydration } = input
+  const profile = ctx.views.profileDetailed(skeleton.did, hydration)
+  if (!profile) {
+    throw new InvalidRequestError('Profile not found')
+  } else if (!params.hydrateCtx.includeTakedowns) {
+    if (ctx.views.actorIsTakendown(skeleton.did, hydration)) {
+      throw new InvalidRequestError(
+        'Account has been suspended',
+        'AccountTakedown',
+      )
+    } else if (ctx.views.actorIsDeactivated(skeleton.did, hydration)) {
+      throw new InvalidRequestError(
+        'Account is deactivated',
+        'AccountDeactivated',
+      )
+    }
+  }
+  return profile
+}
+
+type Context = {
+  hydrator: Hydrator
+  views: Views
+}
+
+type Params = QueryParams & {
+  hydrateCtx: HydrateCtx
+}
+
+type SkeletonState = { did: string }

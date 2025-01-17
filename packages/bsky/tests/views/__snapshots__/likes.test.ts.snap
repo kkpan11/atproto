@@ -2,7 +2,7 @@
 
 exports[`pds like views fetches post likes 1`] = `
 Object {
-  "cursor": "0000000000000::bafycid",
+  "cursor": "0000000000000__bafycid",
   "likes": Array [
     Object {
       "actor": Object {
@@ -19,12 +19,17 @@ Object {
     },
     Object {
       "actor": Object {
+        "associated": Object {
+          "chat": Object {
+            "allowIncoming": "none",
+          },
+        },
         "did": "user(1)",
         "handle": "dan.test",
         "labels": Array [],
         "viewer": Object {
           "blockedBy": false,
-          "following": "record(1)",
+          "following": "record(0)",
           "muted": false,
         },
       },
@@ -38,8 +43,8 @@ Object {
         "labels": Array [],
         "viewer": Object {
           "blockedBy": false,
-          "followedBy": "record(3)",
-          "following": "record(2)",
+          "followedBy": "record(2)",
+          "following": "record(1)",
           "muted": false,
         },
       },
@@ -49,6 +54,7 @@ Object {
     Object {
       "actor": Object {
         "avatar": "https://bsky.public.url/img/avatar/plain/user(4)/cids(0)@jpeg",
+        "createdAt": "1970-01-01T00:00:00.000Z",
         "description": "hi im bob label_me",
         "did": "user(3)",
         "displayName": "bobby",
@@ -57,8 +63,8 @@ Object {
         "labels": Array [],
         "viewer": Object {
           "blockedBy": false,
-          "followedBy": "record(5)",
-          "following": "record(4)",
+          "followedBy": "record(4)",
+          "following": "record(3)",
           "muted": false,
         },
       },
@@ -66,13 +72,13 @@ Object {
       "indexedAt": "1970-01-01T00:00:00.000Z",
     },
   ],
-  "uri": "record(0)",
+  "uri": "record(5)",
 }
 `;
 
 exports[`pds like views fetches reply likes 1`] = `
 Object {
-  "cursor": "0000000000000::bafycid",
+  "cursor": "0000000000000__bafycid",
   "likes": Array [
     Object {
       "actor": Object {
@@ -81,8 +87,8 @@ Object {
         "labels": Array [],
         "viewer": Object {
           "blockedBy": false,
-          "followedBy": "record(2)",
-          "following": "record(1)",
+          "followedBy": "record(1)",
+          "following": "record(0)",
           "muted": false,
         },
       },
@@ -90,6 +96,6 @@ Object {
       "indexedAt": "1970-01-01T00:00:00.000Z",
     },
   ],
-  "uri": "record(0)",
+  "uri": "record(2)",
 }
 `;

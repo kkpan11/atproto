@@ -1,36 +1,94 @@
-import * as common from '@atproto/common'
+import { dedupeStrs, mapDefined } from '@atproto/common'
 import { Server } from '../../../../lexicon'
+import { QueryParams } from '../../../../lexicon/types/app/bsky/feed/getPosts'
 import AppContext from '../../../../context'
-import { PostView } from '../../../../lexicon/types/app/bsky/feed/defs'
+import { createPipeline } from '../../../../pipeline'
+import {
+  HydrateCtx,
+  HydrationState,
+  Hydrator,
+} from '../../../../hydration/hydrator'
+import { Views } from '../../../../views'
+import { uriToDid as creatorFromUri } from '../../../../util/uris'
+import { resHeaders } from '../../../util'
+import { ids } from '../../../../lexicon/lexicons'
 
 export default function (server: Server, ctx: AppContext) {
+  const getPosts = createPipeline(skeleton, hydration, noBlocks, presentation)
   server.app.bsky.feed.getPosts({
-    auth: ctx.authOptionalVerifier,
-    handler: async ({ params, auth }) => {
-      const requester = auth.credentials.did
+    auth: ctx.authVerifier.standardOptionalParameterized({
+      lxmCheck: (method) => {
+        if (!method) return false
+        return (
+          method === ids.AppBskyFeedGetPosts || method.startsWith('chat.bsky.')
+        )
+      },
+    }),
+    handler: async ({ params, auth, req }) => {
+      const viewer = auth.credentials.iss
+      const labelers = ctx.reqLabelers(req)
+      const hydrateCtx = await ctx.hydrator.createContext({ labelers, viewer })
 
-      const uris = common.dedupeStrs(params.uris)
-
-      const db = ctx.db.getReplica()
-      const postViews = await ctx.services
-        .feed(db)
-        .getPostViews(uris, requester)
-
-      const posts: PostView[] = []
-      for (const uri of uris) {
-        const post = postViews[uri]
-        const isBlocked =
-          post?.author.viewer?.blockedBy === true ||
-          typeof post?.author.viewer?.blocking === 'string'
-        if (post && !isBlocked) {
-          posts.push(post)
-        }
-      }
+      const results = await getPosts({ ...params, hydrateCtx }, ctx)
 
       return {
         encoding: 'application/json',
-        body: { posts },
+        body: results,
+        headers: resHeaders({ labelers: hydrateCtx.labelers }),
       }
     },
   })
+}
+
+const skeleton = async (inputs: { params: Params }) => {
+  return { posts: dedupeStrs(inputs.params.uris) }
+}
+
+const hydration = async (inputs: {
+  ctx: Context
+  params: Params
+  skeleton: Skeleton
+}) => {
+  const { ctx, params, skeleton } = inputs
+  return ctx.hydrator.hydratePosts(
+    skeleton.posts.map((uri) => ({ uri })),
+    params.hydrateCtx,
+  )
+}
+
+const noBlocks = (inputs: {
+  ctx: Context
+  skeleton: Skeleton
+  hydration: HydrationState
+}) => {
+  const { ctx, skeleton, hydration } = inputs
+  skeleton.posts = skeleton.posts.filter((uri) => {
+    const creator = creatorFromUri(uri)
+    return !ctx.views.viewerBlockExists(creator, hydration)
+  })
+  return skeleton
+}
+
+const presentation = (inputs: {
+  ctx: Context
+  params: Params
+  skeleton: Skeleton
+  hydration: HydrationState
+}) => {
+  const { ctx, skeleton, hydration } = inputs
+  const posts = mapDefined(skeleton.posts, (uri) =>
+    ctx.views.post(uri, hydration),
+  )
+  return { posts }
+}
+
+type Context = {
+  hydrator: Hydrator
+  views: Views
+}
+
+type Params = QueryParams & { hydrateCtx: HydrateCtx }
+
+type Skeleton = {
+  posts: string[]
 }

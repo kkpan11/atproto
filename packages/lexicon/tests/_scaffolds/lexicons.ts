@@ -1,4 +1,6 @@
-export default [
+import { LexiconDoc } from '../../src/index'
+
+const lexicons: LexiconDoc[] = [
   {
     lexicon: 1,
     id: 'com.example.kitchenSink',
@@ -313,6 +315,24 @@ export default [
   },
   {
     lexicon: 1,
+    id: 'com.example.stringLengthNoMinLength',
+    defs: {
+      main: {
+        type: 'record',
+        record: {
+          type: 'object',
+          properties: {
+            string: {
+              type: 'string',
+              maxLength: 4,
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    lexicon: 1,
     id: 'com.example.stringLengthGrapheme',
     defs: {
       main: {
@@ -521,3 +541,5 @@ export default [
     },
   },
 ]
+
+export default lexicons

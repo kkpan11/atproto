@@ -10,17 +10,18 @@ import {
   CalcPointsFn,
   RateLimitExceededError,
   RateLimiterConsume,
+  RateLimiterReset,
   RateLimiterI,
   RateLimiterStatus,
   XRPCReqContext,
 } from './types'
-import { getReqIp } from './util'
 
 export type RateLimiterOpts = {
   keyPrefix: string
   durationMs: number
   points: number
   bypassSecret?: string
+  bypassIps?: string[]
   calcKey?: CalcKeyFn
   calcPoints?: CalcPointsFn
   failClosed?: boolean
@@ -28,14 +29,16 @@ export type RateLimiterOpts = {
 
 export class RateLimiter implements RateLimiterI {
   public limiter: RateLimiterAbstract
-  private byPassSecret?: string
+  private bypassSecret?: string
+  private bypassIps?: string[]
   private failClosed?: boolean
   public calcKey: CalcKeyFn
   public calcPoints: CalcPointsFn
 
   constructor(limiter: RateLimiterAbstract, opts: RateLimiterOpts) {
     this.limiter = limiter
-    this.byPassSecret = opts.bypassSecret
+    this.bypassSecret = opts.bypassSecret
+    this.bypassIps = opts.bypassIps
     this.calcKey = opts.calcKey ?? defaultKey
     this.calcPoints = opts.calcPoints ?? defaultPoints
   }
@@ -62,14 +65,20 @@ export class RateLimiter implements RateLimiterI {
   async consume(
     ctx: XRPCReqContext,
     opts?: { calcKey?: CalcKeyFn; calcPoints?: CalcPointsFn },
-  ): Promise<RateLimiterStatus | null> {
+  ): Promise<RateLimiterStatus | RateLimitExceededError | null> {
     if (
-      this.byPassSecret &&
-      ctx.req.header('x-ratelimit-bypass') === this.byPassSecret
+      this.bypassSecret &&
+      ctx.req.header('x-ratelimit-bypass') === this.bypassSecret
     ) {
       return null
     }
+    if (this.bypassIps && this.bypassIps.includes(ctx.req.ip)) {
+      return null
+    }
     const key = opts?.calcKey ? opts.calcKey(ctx) : this.calcKey(ctx)
+    if (key === null) {
+      return null
+    }
     const points = opts?.calcPoints
       ? opts.calcPoints(ctx)
       : this.calcPoints(ctx)
@@ -83,7 +92,7 @@ export class RateLimiter implements RateLimiterI {
       // yes this library rejects with a res not an error
       if (err instanceof RateLimiterRes) {
         const status = formatLimiterStatus(this.limiter, err)
-        throw new RateLimitExceededError(status)
+        return new RateLimitExceededError(status)
       } else {
         if (this.failClosed) {
           throw err
@@ -99,6 +108,22 @@ export class RateLimiter implements RateLimiterI {
         )
         return null
       }
+    }
+  }
+
+  async reset(
+    ctx: XRPCReqContext,
+    opts?: { calcKey?: CalcKeyFn },
+  ): Promise<void> {
+    const key = opts?.calcKey ? opts.calcKey(ctx) : this.calcKey(ctx)
+    if (key === null) {
+      return
+    }
+
+    try {
+      await this.limiter.delete(key)
+    } catch (cause) {
+      throw new Error(`rate limiter failed to reset key: ${key}`, { cause })
     }
   }
 }
@@ -120,13 +145,27 @@ export const formatLimiterStatus = (
 export const consumeMany = async (
   ctx: XRPCReqContext,
   fns: RateLimiterConsume[],
-): Promise<void> => {
-  if (fns.length === 0) return
+): Promise<RateLimiterStatus | RateLimitExceededError | null> => {
+  if (fns.length === 0) return null
   const results = await Promise.all(fns.map((fn) => fn(ctx)))
   const tightestLimit = getTightestLimit(results)
-  if (tightestLimit !== null) {
+  if (tightestLimit === null) {
+    return null
+  } else if (tightestLimit instanceof RateLimitExceededError) {
+    setResHeaders(ctx, tightestLimit.status)
+    return tightestLimit
+  } else {
     setResHeaders(ctx, tightestLimit)
+    return tightestLimit
   }
+}
+
+export const resetMany = async (
+  ctx: XRPCReqContext,
+  fns: RateLimiterReset[],
+): Promise<void> => {
+  if (fns.length === 0) return
+  await Promise.all(fns.map((fn) => fn(ctx)))
 }
 
 export const setResHeaders = (
@@ -143,11 +182,12 @@ export const setResHeaders = (
 }
 
 export const getTightestLimit = (
-  resps: (RateLimiterStatus | null)[],
-): RateLimiterStatus | null => {
+  resps: (RateLimiterStatus | RateLimitExceededError | null)[],
+): RateLimiterStatus | RateLimitExceededError | null => {
   let lowest: RateLimiterStatus | null = null
   for (const resp of resps) {
     if (resp === null) continue
+    if (resp instanceof RateLimitExceededError) return resp
     if (lowest === null || resp.remainingPoints < lowest.remainingPoints) {
       lowest = resp
     }
@@ -155,5 +195,7 @@ export const getTightestLimit = (
   return lowest
 }
 
-const defaultKey: CalcKeyFn = (ctx: XRPCReqContext) => getReqIp(ctx.req)
+// when using a proxy, ensure headers are getting forwarded correctly: `app.set('trust proxy', true)`
+// https://expressjs.com/en/guide/behind-proxies.html
+const defaultKey: CalcKeyFn = (ctx: XRPCReqContext) => ctx.req.ip
 const defaultPoints: CalcPointsFn = () => 1

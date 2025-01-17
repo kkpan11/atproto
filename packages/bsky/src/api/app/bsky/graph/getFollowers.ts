@@ -1,78 +1,145 @@
+import { mapDefined } from '@atproto/common'
 import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../../../../lexicon'
-import { paginate, TimeCidKeyset } from '../../../../db/pagination'
+import { QueryParams } from '../../../../lexicon/types/app/bsky/graph/getFollowers'
 import AppContext from '../../../../context'
-import { notSoftDeletedClause } from '../../../../db/util'
+import {
+  HydrationFnInput,
+  PresentationFnInput,
+  RulesFnInput,
+  SkeletonFnInput,
+  createPipeline,
+} from '../../../../pipeline'
+import { uriToDid as didFromUri } from '../../../../util/uris'
+import {
+  HydrateCtx,
+  Hydrator,
+  mergeStates,
+} from '../../../../hydration/hydrator'
+import { Views } from '../../../../views'
+import { clearlyBadCursor, resHeaders } from '../../../util'
 
 export default function (server: Server, ctx: AppContext) {
+  const getFollowers = createPipeline(
+    skeleton,
+    hydration,
+    noBlocks,
+    presentation,
+  )
   server.app.bsky.graph.getFollowers({
-    auth: ctx.authOptionalAccessOrRoleVerifier,
-    handler: async ({ params, auth }) => {
-      const { actor, limit, cursor } = params
-      const requester = 'did' in auth.credentials ? auth.credentials.did : null
-      const canViewTakendownProfile =
-        auth.credentials.type === 'role' && auth.credentials.triage
-      const db = ctx.db.getReplica()
-      const { ref } = db.db.dynamic
-
-      const actorService = ctx.services.actor(db)
-      const graphService = ctx.services.graph(db)
-
-      const subjectRes = await actorService.getActor(
-        actor,
-        canViewTakendownProfile,
-      )
-      if (!subjectRes) {
-        throw new InvalidRequestError(`Actor not found: ${actor}`)
-      }
-
-      let followersReq = db.db
-        .selectFrom('follow')
-        .where('follow.subjectDid', '=', subjectRes.did)
-        .innerJoin('actor as creator', 'creator.did', 'follow.creator')
-        .if(!canViewTakendownProfile, (qb) =>
-          qb.where(notSoftDeletedClause(ref('creator'))),
-        )
-        .whereNotExists(
-          graphService.blockQb(requester, [ref('follow.creator')]),
-        )
-        .whereNotExists(
-          graphService.blockRefQb(
-            ref('follow.subjectDid'),
-            ref('follow.creator'),
-          ),
-        )
-        .selectAll('creator')
-        .select(['follow.cid as cid', 'follow.sortAt as sortAt'])
-
-      const keyset = new TimeCidKeyset(ref('follow.sortAt'), ref('follow.cid'))
-      followersReq = paginate(followersReq, {
-        limit,
-        cursor,
-        keyset,
+    auth: ctx.authVerifier.optionalStandardOrRole,
+    handler: async ({ params, auth, req }) => {
+      const { viewer, includeTakedowns } = ctx.authVerifier.parseCreds(auth)
+      const labelers = ctx.reqLabelers(req)
+      const hydrateCtx = await ctx.hydrator.createContext({
+        labelers,
+        viewer,
+        includeTakedowns,
       })
 
-      const followersRes = await followersReq.execute()
-      const [followers, subject] = await Promise.all([
-        actorService.views.hydrateProfiles(followersRes, requester, {
-          includeSoftDeleted: canViewTakendownProfile,
-        }),
-        actorService.views.profile(subjectRes, requester, {
-          includeSoftDeleted: canViewTakendownProfile,
-        }),
-      ])
-      if (!subject) {
-        throw new InvalidRequestError(`Actor not found: ${actor}`)
-      }
+      const result = await getFollowers({ ...params, hydrateCtx }, ctx)
 
       return {
         encoding: 'application/json',
-        body: {
-          subject,
-          followers,
-          cursor: keyset.packFromResult(followersRes),
-        },
+        body: result,
+        headers: resHeaders({ labelers: hydrateCtx.labelers }),
       }
     },
   })
+}
+
+const skeleton = async (input: SkeletonFnInput<Context, Params>) => {
+  const { params, ctx } = input
+  const [subjectDid] = await ctx.hydrator.actor.getDidsDefined([params.actor])
+  if (!subjectDid) {
+    throw new InvalidRequestError(`Actor not found: ${params.actor}`)
+  }
+  if (clearlyBadCursor(params.cursor)) {
+    return { subjectDid, followUris: [] }
+  }
+  const { followers, cursor } = await ctx.hydrator.graph.getActorFollowers({
+    did: subjectDid,
+    cursor: params.cursor,
+    limit: params.limit,
+  })
+  return {
+    subjectDid,
+    followUris: followers.map((f) => f.uri),
+    cursor: cursor || undefined,
+  }
+}
+
+const hydration = async (
+  input: HydrationFnInput<Context, Params, SkeletonState>,
+) => {
+  const { ctx, params, skeleton } = input
+  const { followUris, subjectDid } = skeleton
+  const followState = await ctx.hydrator.hydrateFollows(followUris)
+  const dids = [subjectDid]
+  if (followState.follows) {
+    for (const [uri, follow] of followState.follows) {
+      if (follow) {
+        dids.push(didFromUri(uri))
+      }
+    }
+  }
+  const profileState = await ctx.hydrator.hydrateProfiles(
+    dids,
+    params.hydrateCtx,
+  )
+  return mergeStates(followState, profileState)
+}
+
+const noBlocks = (input: RulesFnInput<Context, Params, SkeletonState>) => {
+  const { skeleton, params, hydration, ctx } = input
+  const viewer = params.hydrateCtx.viewer
+  skeleton.followUris = skeleton.followUris.filter((followUri) => {
+    const followerDid = didFromUri(followUri)
+    return (
+      !hydration.followBlocks?.get(followUri) &&
+      (!viewer || !ctx.views.viewerBlockExists(followerDid, hydration))
+    )
+  })
+  return skeleton
+}
+
+const presentation = (
+  input: PresentationFnInput<Context, Params, SkeletonState>,
+) => {
+  const { ctx, hydration, skeleton, params } = input
+  const { subjectDid, followUris, cursor } = skeleton
+  const isNoHosted = (did: string) => ctx.views.actorIsNoHosted(did, hydration)
+
+  const subject = ctx.views.profile(subjectDid, hydration)
+  if (
+    !subject ||
+    (!params.hydrateCtx.includeTakedowns && isNoHosted(subjectDid))
+  ) {
+    throw new InvalidRequestError(`Actor not found: ${params.actor}`)
+  }
+
+  const followers = mapDefined(followUris, (followUri) => {
+    const followerDid = didFromUri(followUri)
+    if (!params.hydrateCtx.includeTakedowns && isNoHosted(followerDid)) {
+      return
+    }
+    return ctx.views.profile(didFromUri(followUri), hydration)
+  })
+
+  return { followers, subject, cursor }
+}
+
+type Context = {
+  hydrator: Hydrator
+  views: Views
+}
+
+type Params = QueryParams & {
+  hydrateCtx: HydrateCtx
+}
+
+type SkeletonState = {
+  subjectDid: string
+  followUris: string[]
+  cursor?: string
 }

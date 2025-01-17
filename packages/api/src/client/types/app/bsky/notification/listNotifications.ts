@@ -1,7 +1,7 @@
 /**
  * GENERATED CODE - DO NOT MODIFY
  */
-import { Headers, XRPCError } from '@atproto/xrpc'
+import { HeadersMap, XRPCError } from '@atproto/xrpc'
 import { ValidationResult, BlobRef } from '@atproto/lexicon'
 import { isObj, hasProp } from '../../../../util'
 import { lexicons } from '../../../../lexicons'
@@ -10,7 +10,10 @@ import * as AppBskyActorDefs from '../actor/defs'
 import * as ComAtprotoLabelDefs from '../../../com/atproto/label/defs'
 
 export interface QueryParams {
+  /** Notification reasons to include in response. */
+  reasons?: string[]
   limit?: number
+  priority?: boolean
   cursor?: string
   seenAt?: string
 }
@@ -20,22 +23,23 @@ export type InputSchema = undefined
 export interface OutputSchema {
   cursor?: string
   notifications: Notification[]
+  priority?: boolean
+  seenAt?: string
   [k: string]: unknown
 }
 
 export interface CallOptions {
-  headers?: Headers
+  signal?: AbortSignal
+  headers?: HeadersMap
 }
 
 export interface Response {
   success: boolean
-  headers: Headers
+  headers: HeadersMap
   data: OutputSchema
 }
 
 export function toKnownErr(e: any) {
-  if (e instanceof XRPCError) {
-  }
   return e
 }
 
@@ -43,7 +47,7 @@ export interface Notification {
   uri: string
   cid: string
   author: AppBskyActorDefs.ProfileView
-  /** Expected values are 'like', 'repost', 'follow', 'mention', 'reply', and 'quote'. */
+  /** Expected values are 'like', 'repost', 'follow', 'mention', 'reply', 'quote', and 'starterpack-joined'. */
   reason:
     | 'like'
     | 'repost'
@@ -51,6 +55,7 @@ export interface Notification {
     | 'mention'
     | 'reply'
     | 'quote'
+    | 'starterpack-joined'
     | (string & {})
   reasonSubject?: string
   record: {}

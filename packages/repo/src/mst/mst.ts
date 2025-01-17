@@ -3,7 +3,7 @@ import { CID } from 'multiformats'
 
 import { ReadableBlockstore } from '../storage'
 import { schema as common, cidForCbor, dataToCborBlock } from '@atproto/common'
-import { BlockWriter } from '@ipld/car/api'
+import { BlockWriter } from '@ipld/car/writer'
 import * as util from './util'
 import BlockMap from '../block-map'
 import CidSet from '../cid-set'
@@ -756,6 +756,20 @@ export class MST {
     return cids
   }
 
+  async addBlocksForPath(key: string, blocks: BlockMap) {
+    const serialized = await this.serialize()
+    blocks.set(serialized.cid, serialized.bytes)
+    const index = await this.findGtOrEqualLeafIndex(key)
+    const found = await this.atIndex(index)
+    if (found && found.isLeaf() && found.key === key) {
+      return
+    }
+    const prev = await this.atIndex(index - 1)
+    if (prev && prev.isTree()) {
+      await prev.addBlocksForPath(key, blocks)
+    }
+  }
+
   // Matching Leaf interface
   // -------------------
 
@@ -776,7 +790,10 @@ export class MST {
 }
 
 export class Leaf {
-  constructor(public key: string, public value: CID) {}
+  constructor(
+    public key: string,
+    public value: CID,
+  ) {}
 
   isTree(): this is MST {
     return false

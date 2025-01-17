@@ -1,43 +1,35 @@
 import { Server } from '../../../../lexicon'
 import AppContext from '../../../../context'
-import { getReasonType, getSubject } from './util'
+import { parseProxyInfo } from '../../../../pipethrough'
+import { ids } from '../../../../lexicon/lexicons'
+import { AtpAgent } from '@atproto/api'
+import { AuthScope } from '../../../../auth-verifier'
 
 export default function (server: Server, ctx: AppContext) {
   server.com.atproto.moderation.createReport({
-    auth: ctx.accessVerifierCheckTakedown,
-    handler: async ({ input, auth }) => {
-      const requester = auth.credentials.did
-
-      if (ctx.shouldProxyModeration()) {
-        const { data: result } =
-          await ctx.appviewAgent.com.atproto.moderation.createReport(
-            input.body,
-            {
-              ...(await ctx.serviceAuthHeaders(requester)),
-              encoding: 'application/json',
-            },
-          )
-        return {
-          encoding: 'application/json',
-          body: result,
-        }
-      }
-
-      const { db, services } = ctx
-      const { reasonType, reason, subject } = input.body
-
-      const moderationService = services.moderation(db)
-
-      const report = await moderationService.report({
-        reasonType: getReasonType(reasonType),
-        reason,
-        subject: getSubject(subject),
-        reportedBy: requester,
+    auth: ctx.authVerifier.accessStandard({
+      additional: [AuthScope.Takendown],
+    }),
+    handler: async ({ auth, input, req }) => {
+      const { url, did: aud } = await parseProxyInfo(
+        ctx,
+        req,
+        ids.ComAtprotoModerationCreateReport,
+      )
+      const agent = new AtpAgent({ service: url })
+      const serviceAuth = await ctx.serviceAuthHeaders(
+        auth.credentials.did,
+        aud,
+        ids.ComAtprotoModerationCreateReport,
+      )
+      const res = await agent.com.atproto.moderation.createReport(input.body, {
+        ...serviceAuth,
+        encoding: 'application/json',
       })
 
       return {
         encoding: 'application/json',
-        body: moderationService.views.reportPublic(report),
+        body: res.data,
       }
     },
   })

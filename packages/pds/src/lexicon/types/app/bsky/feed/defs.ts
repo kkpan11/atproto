@@ -7,11 +7,13 @@ import { isObj, hasProp } from '../../../../util'
 import { CID } from 'multiformats/cid'
 import * as AppBskyActorDefs from '../actor/defs'
 import * as AppBskyEmbedImages from '../embed/images'
+import * as AppBskyEmbedVideo from '../embed/video'
 import * as AppBskyEmbedExternal from '../embed/external'
 import * as AppBskyEmbedRecord from '../embed/record'
 import * as AppBskyEmbedRecordWithMedia from '../embed/recordWithMedia'
 import * as ComAtprotoLabelDefs from '../../../com/atproto/label/defs'
 import * as AppBskyRichtextFacet from '../richtext/facet'
+import * as AppBskyGraphDefs from '../graph/defs'
 
 export interface PostView {
   uri: string
@@ -20,6 +22,7 @@ export interface PostView {
   record: {}
   embed?:
     | AppBskyEmbedImages.View
+    | AppBskyEmbedVideo.View
     | AppBskyEmbedExternal.View
     | AppBskyEmbedRecord.View
     | AppBskyEmbedRecordWithMedia.View
@@ -27,9 +30,11 @@ export interface PostView {
   replyCount?: number
   repostCount?: number
   likeCount?: number
+  quoteCount?: number
   indexedAt: string
   viewer?: ViewerState
   labels?: ComAtprotoLabelDefs.Label[]
+  threadgate?: ThreadgateView
   [k: string]: unknown
 }
 
@@ -43,9 +48,14 @@ export function validatePostView(v: unknown): ValidationResult {
   return lexicons.validate('app.bsky.feed.defs#postView', v)
 }
 
+/** Metadata about the requesting account's relationship with the subject content. Only has meaningful content for authed requests. */
 export interface ViewerState {
   repost?: string
   like?: string
+  threadMuted?: boolean
+  replyDisabled?: boolean
+  embeddingDisabled?: boolean
+  pinned?: boolean
   [k: string]: unknown
 }
 
@@ -64,7 +74,9 @@ export function validateViewerState(v: unknown): ValidationResult {
 export interface FeedViewPost {
   post: PostView
   reply?: ReplyRef
-  reason?: ReasonRepost | { $type: string; [k: string]: unknown }
+  reason?: ReasonRepost | ReasonPin | { $type: string; [k: string]: unknown }
+  /** Context provided by feed generator that may be passed back alongside interactions. */
+  feedContext?: string
   [k: string]: unknown
 }
 
@@ -91,6 +103,7 @@ export interface ReplyRef {
     | NotFoundPost
     | BlockedPost
     | { $type: string; [k: string]: unknown }
+  grandparentAuthor?: AppBskyActorDefs.ProfileViewBasic
   [k: string]: unknown
 }
 
@@ -120,6 +133,22 @@ export function isReasonRepost(v: unknown): v is ReasonRepost {
 
 export function validateReasonRepost(v: unknown): ValidationResult {
   return lexicons.validate('app.bsky.feed.defs#reasonRepost', v)
+}
+
+export interface ReasonPin {
+  [k: string]: unknown
+}
+
+export function isReasonPin(v: unknown): v is ReasonPin {
+  return (
+    isObj(v) &&
+    hasProp(v, '$type') &&
+    v.$type === 'app.bsky.feed.defs#reasonPin'
+  )
+}
+
+export function validateReasonPin(v: unknown): ValidationResult {
+  return lexicons.validate('app.bsky.feed.defs#reasonPin', v)
 }
 
 export interface ThreadViewPost {
@@ -215,7 +244,13 @@ export interface GeneratorView {
   descriptionFacets?: AppBskyRichtextFacet.Main[]
   avatar?: string
   likeCount?: number
+  acceptsInteractions?: boolean
+  labels?: ComAtprotoLabelDefs.Label[]
   viewer?: GeneratorViewerState
+  contentMode?:
+    | 'app.bsky.feed.defs#contentModeUnspecified'
+    | 'app.bsky.feed.defs#contentModeVideo'
+    | (string & {})
   indexedAt: string
   [k: string]: unknown
 }
@@ -251,7 +286,12 @@ export function validateGeneratorViewerState(v: unknown): ValidationResult {
 
 export interface SkeletonFeedPost {
   post: string
-  reason?: SkeletonReasonRepost | { $type: string; [k: string]: unknown }
+  reason?:
+    | SkeletonReasonRepost
+    | SkeletonReasonPin
+    | { $type: string; [k: string]: unknown }
+  /** Context that will be passed through to client and may be passed to feed generator back alongside interactions. */
+  feedContext?: string
   [k: string]: unknown
 }
 
@@ -283,3 +323,102 @@ export function isSkeletonReasonRepost(v: unknown): v is SkeletonReasonRepost {
 export function validateSkeletonReasonRepost(v: unknown): ValidationResult {
   return lexicons.validate('app.bsky.feed.defs#skeletonReasonRepost', v)
 }
+
+export interface SkeletonReasonPin {
+  [k: string]: unknown
+}
+
+export function isSkeletonReasonPin(v: unknown): v is SkeletonReasonPin {
+  return (
+    isObj(v) &&
+    hasProp(v, '$type') &&
+    v.$type === 'app.bsky.feed.defs#skeletonReasonPin'
+  )
+}
+
+export function validateSkeletonReasonPin(v: unknown): ValidationResult {
+  return lexicons.validate('app.bsky.feed.defs#skeletonReasonPin', v)
+}
+
+export interface ThreadgateView {
+  uri?: string
+  cid?: string
+  record?: {}
+  lists?: AppBskyGraphDefs.ListViewBasic[]
+  [k: string]: unknown
+}
+
+export function isThreadgateView(v: unknown): v is ThreadgateView {
+  return (
+    isObj(v) &&
+    hasProp(v, '$type') &&
+    v.$type === 'app.bsky.feed.defs#threadgateView'
+  )
+}
+
+export function validateThreadgateView(v: unknown): ValidationResult {
+  return lexicons.validate('app.bsky.feed.defs#threadgateView', v)
+}
+
+export interface Interaction {
+  item?: string
+  event?:
+    | 'app.bsky.feed.defs#requestLess'
+    | 'app.bsky.feed.defs#requestMore'
+    | 'app.bsky.feed.defs#clickthroughItem'
+    | 'app.bsky.feed.defs#clickthroughAuthor'
+    | 'app.bsky.feed.defs#clickthroughReposter'
+    | 'app.bsky.feed.defs#clickthroughEmbed'
+    | 'app.bsky.feed.defs#interactionSeen'
+    | 'app.bsky.feed.defs#interactionLike'
+    | 'app.bsky.feed.defs#interactionRepost'
+    | 'app.bsky.feed.defs#interactionReply'
+    | 'app.bsky.feed.defs#interactionQuote'
+    | 'app.bsky.feed.defs#interactionShare'
+    | (string & {})
+  /** Context on a feed item that was originally supplied by the feed generator on getFeedSkeleton. */
+  feedContext?: string
+  [k: string]: unknown
+}
+
+export function isInteraction(v: unknown): v is Interaction {
+  return (
+    isObj(v) &&
+    hasProp(v, '$type') &&
+    v.$type === 'app.bsky.feed.defs#interaction'
+  )
+}
+
+export function validateInteraction(v: unknown): ValidationResult {
+  return lexicons.validate('app.bsky.feed.defs#interaction', v)
+}
+
+/** Request that less content like the given feed item be shown in the feed */
+export const REQUESTLESS = 'app.bsky.feed.defs#requestLess'
+/** Request that more content like the given feed item be shown in the feed */
+export const REQUESTMORE = 'app.bsky.feed.defs#requestMore'
+/** User clicked through to the feed item */
+export const CLICKTHROUGHITEM = 'app.bsky.feed.defs#clickthroughItem'
+/** User clicked through to the author of the feed item */
+export const CLICKTHROUGHAUTHOR = 'app.bsky.feed.defs#clickthroughAuthor'
+/** User clicked through to the reposter of the feed item */
+export const CLICKTHROUGHREPOSTER = 'app.bsky.feed.defs#clickthroughReposter'
+/** User clicked through to the embedded content of the feed item */
+export const CLICKTHROUGHEMBED = 'app.bsky.feed.defs#clickthroughEmbed'
+/** Declares the feed generator returns any types of posts. */
+export const CONTENTMODEUNSPECIFIED =
+  'app.bsky.feed.defs#contentModeUnspecified'
+/** Declares the feed generator returns posts containing app.bsky.embed.video embeds. */
+export const CONTENTMODEVIDEO = 'app.bsky.feed.defs#contentModeVideo'
+/** Feed item was seen by user */
+export const INTERACTIONSEEN = 'app.bsky.feed.defs#interactionSeen'
+/** User liked the feed item */
+export const INTERACTIONLIKE = 'app.bsky.feed.defs#interactionLike'
+/** User reposted the feed item */
+export const INTERACTIONREPOST = 'app.bsky.feed.defs#interactionRepost'
+/** User replied to the feed item */
+export const INTERACTIONREPLY = 'app.bsky.feed.defs#interactionReply'
+/** User quoted the feed item */
+export const INTERACTIONQUOTE = 'app.bsky.feed.defs#interactionQuote'
+/** User shared the feed item */
+export const INTERACTIONSHARE = 'app.bsky.feed.defs#interactionShare'

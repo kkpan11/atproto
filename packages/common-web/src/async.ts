@@ -72,6 +72,8 @@ export class AsyncBuffer<T> {
   private buffer: T[] = []
   private promise: Promise<void>
   private resolve: () => void
+  private closed = false
+  private toThrow: unknown | undefined
 
   constructor(public maxSize?: number) {
     // Initializing to satisfy types/build, immediately reset by resetPromise()
@@ -86,6 +88,10 @@ export class AsyncBuffer<T> {
 
   get size(): number {
     return this.buffer.length
+  }
+
+  get isClosed(): boolean {
+    return this.closed
   }
 
   resetPromise() {
@@ -104,7 +110,17 @@ export class AsyncBuffer<T> {
 
   async *events(): AsyncGenerator<T> {
     while (true) {
+      if (this.closed && this.buffer.length === 0) {
+        if (this.toThrow) {
+          throw this.toThrow
+        } else {
+          return
+        }
+      }
       await this.promise
+      if (this.toThrow) {
+        throw this.toThrow
+      }
       if (this.maxSize && this.size > this.maxSize) {
         throw new AsyncBufferFullError(this.maxSize)
       }
@@ -117,10 +133,94 @@ export class AsyncBuffer<T> {
       }
     }
   }
+
+  throw(err: unknown) {
+    this.toThrow = err
+    this.closed = true
+    this.resolve()
+  }
+
+  close() {
+    this.closed = true
+    this.resolve()
+  }
 }
 
 export class AsyncBufferFullError extends Error {
   constructor(maxSize: number) {
     super(`ReachedMaxBufferSize: ${maxSize}`)
   }
+}
+
+/**
+ * Utility function that behaves like {@link Promise.allSettled} but returns the
+ * same result as {@link Promise.all} in case every promise is fulfilled, and
+ * throws an {@link AggregateError} if there are more than one errors.
+ */
+export function allFulfilled<T extends readonly unknown[] | []>(
+  promises: T,
+): Promise<{ -readonly [P in keyof T]: Awaited<T[P]> }>
+export function allFulfilled<T>(
+  promises: Iterable<T | PromiseLike<T>>,
+): Promise<Awaited<T>[]>
+export function allFulfilled(
+  promises: Iterable<Promise<unknown>>,
+): Promise<unknown[]> {
+  return Promise.allSettled(promises).then(handleAllSettledErrors)
+}
+
+export function handleAllSettledErrors<
+  T extends readonly PromiseSettledResult<unknown>[] | [],
+>(
+  results: T,
+): {
+  -readonly [P in keyof T]: T[P] extends PromiseSettledResult<infer U>
+    ? U
+    : never
+}
+export function handleAllSettledErrors<T>(
+  results: PromiseSettledResult<T>[],
+): T[]
+export function handleAllSettledErrors(
+  results: PromiseSettledResult<unknown>[],
+): unknown[] {
+  const errors = results.filter(isRejectedResult).map(extractReason)
+  if (errors.length === 0) {
+    // No need to filter here, it is safe to assume that all promises are fulfilled
+    return (results as PromiseFulfilledResult<unknown>[]).map(extractValue)
+  }
+  if (errors.length === 1) {
+    throw errors[0]
+  }
+  throw new AggregateError(
+    errors,
+    `Multiple errors: ${errors.map(stringifyReason).join('\n')}`,
+  )
+}
+
+export function isRejectedResult(
+  result: PromiseSettledResult<unknown>,
+): result is PromiseRejectedResult {
+  return result.status === 'rejected'
+}
+
+function extractReason(result: PromiseRejectedResult): unknown {
+  return result.reason
+}
+
+export function isFulfilledResult<T>(
+  result: PromiseSettledResult<T>,
+): result is PromiseFulfilledResult<T> {
+  return result.status === 'fulfilled'
+}
+
+function extractValue<T>(result: PromiseFulfilledResult<T>): T {
+  return result.value
+}
+
+function stringifyReason(reason: unknown): string {
+  if (reason instanceof Error) {
+    return reason.message
+  }
+  return String(reason)
 }

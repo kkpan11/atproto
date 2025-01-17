@@ -1,7 +1,7 @@
 /**
  * GENERATED CODE - DO NOT MODIFY
  */
-import { Headers, XRPCError } from '@atproto/xrpc'
+import { HeadersMap, XRPCError } from '@atproto/xrpc'
 import { ValidationResult, BlobRef } from '@atproto/lexicon'
 import { isObj, hasProp } from '../../../../util'
 import { lexicons } from '../../../../lexicons'
@@ -18,21 +18,22 @@ export type InputSchema = undefined
 export interface OutputSchema {
   cursor?: string
   actors: AppBskyActorDefs.ProfileView[]
+  /** Snowflake for this recommendation, use when submitting recommendation events. */
+  recId?: number
   [k: string]: unknown
 }
 
 export interface CallOptions {
-  headers?: Headers
+  signal?: AbortSignal
+  headers?: HeadersMap
 }
 
 export interface Response {
   success: boolean
-  headers: Headers
+  headers: HeadersMap
   data: OutputSchema
 }
 
 export function toKnownErr(e: any) {
-  if (e instanceof XRPCError) {
-  }
   return e
 }
